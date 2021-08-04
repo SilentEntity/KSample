@@ -13,4 +13,4 @@ COPY . /usr/src/app
 
 EXPOSE 8010
 
-CMD ["gunicorn", "sample.wsgi", "--bind 0.0.0.0:8010", "--workers 3"]
+CMD ["gunicorn", "--bind", ":8010", "--workers", "3", "Sample.wsgi"]
