@@ -1,0 +1,160 @@
+{
+    "AWSTemplateFormationVersion" : "2021-01-01",
+    "Description" : "AWS CloudFormation template for SNS - to - SQS | Clocking/Hang Events",
+    "Resources" : {
+        "SNSTopicClocking" : {
+            "Type" : "AWS::SNS::Topic",
+            "Properties" : {
+                "Subscription" : [{
+                    "EndPoint" : { "Fn::GetAtt" : ["ClockingEventQue","Arn"] },
+                    "Protocol" : "sqs",
+                    "FilterPolicy": {
+                        "clock-status": ["On-AND-On", "Hang"]
+                     }
+                }]
+            }
+        },
+        "ClockingEventQue" : {
+            "Type" : "AWS::SQS::Queue",
+            "Properties" : {
+                "DelaySeconds": 0,
+                "VisibilityTimeout": 120
+            }
+        },
+        "ClockingEventQuePolicy":{
+            "Type" : "AWS::SQS::QueuePolicy",
+            "Properties" : {
+                "Id" : "ClockingEventQuePolicy",
+                "Statement" : [{
+                    "Sid" : "Allow Send Message to Que from SNS Topic",
+                    "Effect" : "Allow",
+                    "Principal" : {"AWS":"*"},
+                    "Action":["sqs:SendMessage"],
+                    "Resource":"*",
+                    "Condition":{
+                        "ArnEquals" : {"aws:SourceArn":{"Ref":"SNSTopicClocking"}}
+                    }
+                }]
+            },
+            "Queues":[{"Ref":"ClockingEventQue"}]
+        },
+        "LambdaRole": {
+            "Type" : "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Action": ["sts:AssumeRole"],
+                        "Effect": "Allow",
+                        "Principal": {
+                          "Service": ["lambda.amazonaws.com","s3.amazonaws.com"]
+                        }
+                    }]
+                },
+                "Policies":[{
+                    "PolicyName" : "Lambda Role for access to S3 and SQS",
+                    "PolicyDocument" : [{
+                        "Effect" : "Allow",
+                        "Action" : [ "s3:PutObject", "s3:GetObject" ],
+                        "Resource" : {"Fn::Join": [ "", [ "arn:aws:s3:::",{"Ref": "S3BucketToWriteInto"},"/*"]]}                        
+                    },{
+                        "Effect" : "Allow",
+                        "Action" : [ "sqs:DeleteMessage", "sqs:ReceiveMessage", "sqs:GetQueueAttributes", "sqs:ChangeMessageVisibility"],
+                        "Resource" : [ { "Fn::GetAtt" : ["ClockingEventQue","Arn"]} ]
+                    }]
+                }]                
+            }
+        },
+        "LambdaForS3Writes":{
+            "Type":"AWS::Lambda::Function",
+            "Properties" : {
+                "Handler": "index.lambda_handler",
+                "Code": {
+                    "ZipFile" : {"Fn::Join" : [
+                        "\n", [
+                        "import time",
+                        "def lambda_handler(event, context):",
+                        "    print(record['body'])",
+                        "    logs = str(record['body']).encode('utf-8')",
+                        "    path = 'logs/' + str(time.time())",
+                        "    # boto3 is already present in python3.8 in lambda",
+                        "    s3 = boto3.resource('s3')",
+                        "    s3.Bucket('S3BucketToWriteInto').put_object(Key=path, Body=logs)"
+                        ]
+                    ]}
+                },
+                "Role": { "Fn::GetAtt" : ["LambdaRole","Arn"] },
+                "Runtime": "python3.8",
+                "Timeout": 60,
+                "MemorySize": 256
+            }
+        },
+        "EventSourceMap":{
+            "Type" : "AWS::Lambda::EventSourceMapping",
+            "Properties" : {
+                "Enabled" : true,
+                "EventSourceArn" : { "Fn::GetAtt" : [ "ClockingEventQue", "Arn" ] },
+                "FunctionName" : { "Fn::GetAtt" : [ "LambdaForS3Writes", "Arn" ] },
+                "TumblingWindowInSeconds" : 300
+            }
+        },        
+        "PermissionToInvoke":{
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "Action": "lambda:InvokeFunction",
+                "FunctionName": { "Ref": "LambdaForS3Writes"},
+                "SourceArn": { "Fn::GetAtt": [ "ClockingEventQue", "Arn" ] },
+                "Principal": "sqs.amazonaws.com"
+            }
+        },
+        "S3BucketToWriteInto" : {
+            "Type": "AWS::S3::Bucket",
+            "Properties":{
+                "AccessControl":"Private",
+                "VersioningConfiguration": {
+                    "Status": "Enabled"
+                },
+                "LifecycleConfiguration":{
+                    "Rules":[{
+                        "Id": "role-1",
+                        "Prefix": "logs/",
+                        "Status": "Enabled",
+                        "ExpirationInDays": 365,
+                        "Transitions": [{
+                            "TransitionInDays": 30,
+                            "StorageClass": "STANDARD_IA"
+                        },
+                        {
+                            "TransitionInDays": 90,
+                            "StorageClass": "GLACIER"
+                        }]
+                    }]
+                }
+            }
+        },
+        "S3BucketPolicyToAllowlambda":{
+            "Type": "AWS::S3::BucketPolicy",
+            "Properties": {
+                "Bucket": {"Ref": "S3BucketToWriteInto"},
+                "PolicyDocument" : {
+                    "Statement": [{
+                        "Effect" : "Allow",
+                        "Action" : ["s3:GetObject","s3:PutObject"],
+                        "Resource" : {"Fn::Join": [ "", [ "arn:aws:s3:::",{"Ref": "S3BucketToWriteInto"},"/*"]]},
+                        "Principal" : { "AWS": [ { "Fn::GetAtt" : ["LambdaRole","Arn"] } ] }
+                    }]
+                }
+            }
+        }
+    },
+    "Outputs":{
+        "SNSTopicClockingArn":{
+            "Value" : {"Ref" : "SNSTopicClocking"},
+            "Description": "SNSTopicClocking topic ARN"
+        },
+        "ClockingEventQueArn":{
+            "Value": { "Fn::GetAtt" : [ "ClockingEventQue", "Arn" ] },
+            "Description": "SQS ClockingEventQue ARN"
+        }        
+    }
+}
